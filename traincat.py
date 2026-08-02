@@ -6,10 +6,10 @@ from sklearn.metrics import roc_auc_score
 from utils import (
     load_data, 
     add_interaction_features, 
-    encode_categorical, 
+    fit_encode_categorical, 
     get_folds, 
     save_predictions,
-    save_model_artifact,
+    save_fold_model,
     N_SPLITS,
     RANDOM_STATE
 )
@@ -22,8 +22,8 @@ def train_catboost():
     print("Engineering interaction features...")
     X, test = add_interaction_features(X, test)
     
-    print("Encoding categorical columns...")
-    X, test = encode_categorical(X, test)
+    print("Encoding categorical columns statefully...")
+    X, test = fit_encode_categorical(X, test)
     
     folds = get_folds(X, y)
     
@@ -58,7 +58,8 @@ def train_catboost():
         fold_auc = roc_auc_score(y_val, oof_predictions[val_idx])
         print(f"-> Fold {fold + 1} CatBoost AUC: {fold_auc:.5f}")
 
-    save_model_artifact(model, "cat")
+        save_fold_model(model, "cat", fold)
+
     save_predictions(oof_predictions, test_predictions, test_ids, name="cat")
 
 if __name__ == "__main__":
