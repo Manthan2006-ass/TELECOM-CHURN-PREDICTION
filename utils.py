@@ -3,6 +3,7 @@ import pickle
 import numpy as np
 import pandas as pd
 from sklearn.model_selection import StratifiedKFold
+from sklearn.preprocessing import OrdinalEncoder
 
 RANDOM_STATE = 42
 N_SPLITS = 10
@@ -12,6 +13,17 @@ TRAIN_PATH = os.path.join(BASE_DIR, "train.csv")
 TEST_PATH = os.path.join(BASE_DIR, "test.csv")
 ORIG_PATH = os.path.join(BASE_DIR, "Telco_customer_churn.csv")
 OUTPUT_DIR = os.path.join(BASE_DIR, "outputs")
+ENCODER_PATH = os.path.join(OUTPUT_DIR, "encoder.pkl")
+
+CONFIG = {
+    "pseudo_high_thresh": 0.92,
+    "pseudo_low_thresh": 0.08,
+    "weights": {
+        "lgb": 0.40,
+        "cat": 0.30,
+        "pseudo": 0.30
+    }
+}
 
 def load_data():
     print("Reading CSV source files from disk...")
@@ -45,8 +57,6 @@ def load_data():
     
     for name, df in [("train.csv", train), ("Telco_customer_churn.csv", orig)]:
         if target_col not in df.columns:
-            print(f"CRITICAL CRASH: '{target_col}' column missing in {name}!")
-            print(f"Available header list: {list(df.columns)}")
             raise KeyError(f"Could not resolve key '{target_col}' in file {name}")
             
         if df[target_col].dtype == 'O':
@@ -80,33 +90,56 @@ def add_interaction_features(X, test):
         test['TotalCharges_Estimate'] = test[tenure_col] * test[monthly_col]
         
     if monthly_col and total_col:
-        X['Charges_Ratio'] = X[monthly_col] / (X[total_col] + 1)
-        test['Charges_Ratio'] = test[monthly_col] / (test[total_col] + 1)
+        # FIX: Zero-division protection preventing np.inf values
+        X['Charges_Ratio'] = X[monthly_col] / np.maximum(X[total_col] + 1, 1e-5)
+        test['Charges_Ratio'] = test[monthly_col] / np.maximum(test[total_col] + 1, 1e-5)
         
     return X, test
 
-def encode_categorical(X, test):
+def fit_encode_categorical(X, test):
     X = X.copy()
     test = test.copy()
     
     cat_cols = X.select_dtypes(include=['object', 'category']).columns.tolist()
     
-    for col in cat_cols:
-        X[col] = X[col].astype(str)
-        test[col] = test[col].astype(str)
+    # FIX: Encodes unknown OOV categories as np.nan instead of arbitrary integers (-1)
+    encoder = OrdinalEncoder(handle_unknown='use_encoded_value', unknown_value=np.nan)
+    
+    X[cat_cols] = encoder.fit_transform(X[cat_cols].astype(str))
+    test[cat_cols] = encoder.transform(test[cat_cols].astype(str))
+    
+    if not os.path.exists(OUTPUT_DIR):
+        os.makedirs(OUTPUT_DIR)
         
-        joint_vocab = list(set(X[col].unique()).union(set(test[col].unique())))
-        vocab_mapping = {token: index for index, token in enumerate(joint_vocab)}
+    training_cols = X.columns.tolist()
+    with open(ENCODER_PATH, "wb") as f:
+        pickle.dump((encoder, cat_cols, training_cols), f)
         
-        X[col] = X[col].map(vocab_mapping)
-        test[col] = test[col].map(vocab_mapping)
-        
-    X = X.apply(pd.to_numeric, errors='coerce').fillna(0)
-    test = test.apply(pd.to_numeric, errors='coerce').fillna(0)
+    X = X.apply(pd.to_numeric, errors='coerce')
+    test = test.apply(pd.to_numeric, errors='coerce')
     
     test = test[X.columns]
-    
     return X, test
+
+def transform_categorical_inference(df):
+    df = df.copy()
+    if not os.path.exists(ENCODER_PATH):
+        raise FileNotFoundError("Encoder not found! Please run training scripts first.")
+        
+    with open(ENCODER_PATH, "rb") as f:
+        encoder, cat_cols, training_cols = pickle.load(f)
+        
+    # FIX: Column Alignment Safety for dynamic batch CSV uploads
+    df = df.reindex(columns=[c for c in df.columns if c in training_cols] + 
+                            [c for c in training_cols if c not in df.columns])
+    
+    present_cat_cols = [col for col in cat_cols if col in df.columns]
+    df[present_cat_cols] = encoder.transform(df[present_cat_cols].astype(str))
+    
+    df = df.apply(pd.to_numeric, errors='coerce')
+    df = df.reindex(columns=training_cols, fill_value=0)
+    
+    return df
 
 def get_folds(X, y):
     skf = StratifiedKFold(n_splits=N_SPLITS, shuffle=True, random_state=RANDOM_STATE)
@@ -117,31 +150,23 @@ def save_predictions(oof_predictions, test_predictions, test_ids, name):
         os.makedirs(OUTPUT_DIR)
         
     oof_df = pd.DataFrame({"oof": oof_predictions})
-    oof_path = os.path.join(OUTPUT_DIR, f"oof_{name}.csv")
-    oof_df.to_csv(oof_path, index=False)
+    oof_df.to_csv(os.path.join(OUTPUT_DIR, f"oof_{name}.csv"), index=False)
     
-    sub_df = pd.DataFrame({
-        "id": test_ids,
-        "Churn": test_predictions
-    })
-    sub_path = os.path.join(OUTPUT_DIR, f"submission_{name}.csv")
-    sub_df.to_csv(sub_path, index=False)
-    
-    print(f"File export successful for [{name.upper()}]:")
-    print(f"   -> OOF Saved: {oof_path}")
-    print(f"   -> Sub Saved: {sub_path}")
+    sub_df = pd.DataFrame({"id": test_ids, "Churn": test_predictions})
+    sub_df.to_csv(os.path.join(OUTPUT_DIR, f"submission_{name}.csv"), index=False)
 
-def save_model_artifact(model_object, name):
+def save_fold_model(model_object, name, fold):
     if not os.path.exists(OUTPUT_DIR):
         os.makedirs(OUTPUT_DIR)
-    model_path = os.path.join(OUTPUT_DIR, f"model_{name}.pkl")
+    model_path = os.path.join(OUTPUT_DIR, f"model_{name}_fold_{fold}.pkl")
     with open(model_path, "wb") as f:
         pickle.dump(model_object, f)
-    print(f"   -> Saved model binary: {model_path}")
 
-def load_model_artifact(name):
-    model_path = os.path.join(OUTPUT_DIR, f"model_{name}.pkl")
-    if not os.path.exists(model_path):
-        return None
-    with open(model_path, "rb") as f:
-        return pickle.load(f)
+def load_all_fold_models(name):
+    models = []
+    for fold in range(N_SPLITS):
+        path = os.path.join(OUTPUT_DIR, f"model_{name}_fold_{fold}.pkl")
+        if os.path.exists(path):
+            with open(path, "rb") as f:
+                models.append(pickle.load(f))
+    return models
