@@ -6,10 +6,10 @@ from sklearn.metrics import roc_auc_score
 from utils import (
     load_data, 
     add_interaction_features, 
-    encode_categorical, 
+    fit_encode_categorical, 
     get_folds, 
     save_predictions,
-    save_model_artifact,
+    save_fold_model,
     N_SPLITS,
     RANDOM_STATE
 )
@@ -22,8 +22,8 @@ def train_lightgbm():
     print("Engineering interaction features...")
     X, test = add_interaction_features(X, test)
     
-    print("Encoding categorical columns...")
-    X, test = encode_categorical(X, test)
+    print("Encoding categorical columns statefully...")
+    X, test = fit_encode_categorical(X, test)
     
     folds = get_folds(X, y)
     
@@ -40,7 +40,7 @@ def train_lightgbm():
         "verbose": -1
     }
     
-    print("\nStarting 10-Fold Cross-Validation...")
+    print("\nStarting 10-Fold Cross-Validation for LightGBM...")
     for fold, (train_idx, val_idx) in enumerate(folds):
         X_train, y_train = X.iloc[train_idx], y.iloc[train_idx]
         X_val, y_val = X.iloc[val_idx], y.iloc[val_idx]
@@ -57,9 +57,10 @@ def train_lightgbm():
         test_predictions += model.predict_proba(test)[:, 1] / N_SPLITS
         
         fold_auc = roc_auc_score(y_val, oof_predictions[val_idx])
-        print(f"-> Fold {fold + 1} AUC: {fold_auc:.5f}")
+        print(f"-> Fold {fold + 1} LightGBM AUC: {fold_auc:.5f}")
 
-    save_model_artifact(model, "lgb")
+        save_fold_model(model, "lgb", fold)
+
     save_predictions(oof_predictions, test_predictions, test_ids, name="lgb")
 
 if __name__ == "__main__":
