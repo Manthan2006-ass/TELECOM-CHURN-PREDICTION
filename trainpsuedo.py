@@ -7,13 +7,14 @@ from sklearn.metrics import roc_auc_score
 from utils import (
     load_data, 
     add_interaction_features, 
-    encode_categorical, 
+    fit_encode_categorical, 
     get_folds, 
     save_predictions,
-    save_model_artifact,
+    save_fold_model,
     N_SPLITS,
     RANDOM_STATE,
-    OUTPUT_DIR
+    OUTPUT_DIR,
+    CONFIG
 )
 
 def train_pseudo_labeling():
@@ -24,19 +25,19 @@ def train_pseudo_labeling():
     print("Engineering interaction features...")
     X, test = add_interaction_features(X, test)
     
-    print("Encoding categorical columns...")
-    X, test = encode_categorical(X, test)
+    print("Encoding categorical columns statefully...")
+    X, test = fit_encode_categorical(X, test)
     
     lgb_pred_path = f"{OUTPUT_DIR}/submission_lgb.csv"
     if not os.path.exists(lgb_pred_path):
-        raise FileNotFoundError("Please run train_lgb.py first to generate test predictions!")
+        raise FileNotFoundError("Please run trainlgb.py first to generate test predictions!")
     
     print("Loading LightGBM predictions to find confident test rows...")
     sub_df = pd.read_csv(lgb_pred_path)
     test_preds = sub_df["Churn"].values
 
-    HIGH_THRESH = 0.92  
-    LOW_THRESH = 0.08   
+    HIGH_THRESH = CONFIG["pseudo_high_thresh"]
+    LOW_THRESH = CONFIG["pseudo_low_thresh"]
 
     high_risk_mask = test_preds >= HIGH_THRESH
     low_risk_mask = test_preds <= LOW_THRESH
@@ -47,7 +48,6 @@ def train_pseudo_labeling():
     pseudo_y_series = pd.Series(pseudo_y, index=pseudo_X.index)
 
     print(f"-> Found {len(pseudo_X)} highly confident test rows to use as pseudo-labels.")
-    print(f"   (Churn: {sum(pseudo_y)}, Stay: {len(pseudo_y) - sum(pseudo_y)})")
 
     folds = get_folds(X, y)
     
@@ -86,7 +86,8 @@ def train_pseudo_labeling():
         fold_auc = roc_auc_score(y_val, oof_predictions[val_idx])
         print(f"-> Fold {fold + 1} Pseudo-LGBM AUC: {fold_auc:.5f}")
 
-    save_model_artifact(model, "pseudo")
+        save_fold_model(model, "pseudo", fold)
+
     save_predictions(oof_predictions, test_predictions, test_ids, name="pseudo")
 
 if __name__ == "__main__":
