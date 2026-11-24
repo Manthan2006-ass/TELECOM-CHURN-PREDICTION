@@ -6,21 +6,56 @@ import streamlit as st
 from utils import (
     add_interaction_features, 
     transform_categorical_inference, 
-    load_all_fold_models
+    load_master_models,
+    predict_master_ensemble,
+    explain_customer_risk,
+    OPTIMAL_THRESHOLD,
+    CONFIG
 )
 
+# Configure Streamlit page layout
 st.set_page_config(
-    page_title="Telco Churn Predictive Engine",
+    page_title="Telco Churn Predictive & Retention Intelligence Engine",
+    page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-st.title("Telecom Customer Churn Prediction Framework")
-st.subheader("An Enterprise ML Pipeline utilizing K-Fold Ensembles & FastAPI Backend")
+# Model Registry Caching
+@st.cache_resource(show_spinner=False)
+def get_cached_models():
+    """Caches loaded models in memory across user interactions."""
+    return load_master_models()
+
+master_models = get_cached_models()
+lgb_models = master_models.get("lgb", [])
+cat_models = master_models.get("cat", [])
+pseudo_models = master_models.get("pseudo", [])
+total_loaded_folds = len(lgb_models) + len(cat_models) + len(pseudo_models)
 
 API_URL_SINGLE = "http://localhost:8000/predict"
 API_URL_BATCH = "http://localhost:8000/predict-batch"
 
+# Header section
+st.title("Telecom Customer Churn & Retention Intelligence Engine")
+st.caption("Enterprise 10-Fold Blended Ensemble (LightGBM + CatBoost + Pseudo-Labeling) | Evaluated on 601k+ Customer Records (ROC-AUC: 0.9158)")
+
+# Sidebar: Controls & Input
+st.sidebar.header("Decision Boundary & Calibration")
+threshold_mode = st.sidebar.radio(
+    "Decision Strategy",
+    options=["Optimal F1-Score (36% - Recommended)", "Conservative (50%)", "Custom"],
+    help="Targeting the top deciles with a calibrated 0.36 threshold captures 78.1% of all churners."
+)
+
+if threshold_mode == "Optimal F1-Score (36% - Recommended)":
+    decision_threshold = OPTIMAL_THRESHOLD
+elif threshold_mode == "Conservative (50%)":
+    decision_threshold = 0.50
+else:
+    decision_threshold = st.sidebar.slider("Custom Churn Cutoff", min_value=0.10, max_value=0.90, value=OPTIMAL_THRESHOLD, step=0.01)
+
+st.sidebar.markdown("---")
 st.sidebar.header("Single Customer Profile")
 
 gender = st.sidebar.selectbox("Gender", ["Male", "Female"])
@@ -29,7 +64,7 @@ partner = st.sidebar.selectbox("Partner status", ["Yes", "No"])
 dependents = st.sidebar.selectbox("Dependents status", ["No", "Yes"])
 tenure = st.sidebar.slider("Tenure Length (Months)", min_value=0, max_value=72, value=12)
 
-# Dynamic UI Dropdown Synchronization
+# Dynamic dropdown synchronization
 phone = st.sidebar.selectbox("Phone Service", ["Yes", "No"])
 if phone == "No":
     multiple_lines = st.sidebar.selectbox("Multiple Lines Service", ["No phone service"], disabled=True)
@@ -65,9 +100,10 @@ contract = st.sidebar.selectbox("Contract Terms", ["Month-to-month", "One year",
 billing = st.sidebar.selectbox("Paperless Billing", ["Yes", "No"])
 payment = st.sidebar.selectbox("Payment Gateway Type", ["Electronic check", "Mailed check", "Bank transfer (automatic)", "Credit card (automatic)"])
 monthly_charges = st.sidebar.slider("Monthly Charges ($)", min_value=18.0, max_value=120.0, value=65.0)
-total_charges = st.sidebar.number_input("Total Contract Accumulation Charges ($)", min_value=0.0, value=780.0)
+total_charges = st.sidebar.number_input("Total Accumulation Charges ($)", min_value=0.0, value=float(tenure * monthly_charges))
 
-if st.sidebar.button("Run Risk Analysis", use_container_width=True):
+# Single Customer Scoring
+if st.sidebar.button("Run Churn Risk Analysis", use_container_width=True, type="primary"):
     payload = {
         "gender": gender, "SeniorCitizen": 1 if senior == "Yes" else 0,
         "Partner": partner, "Dependents": dependents, "tenure": tenure,
@@ -80,47 +116,94 @@ if st.sidebar.button("Run Risk Analysis", use_container_width=True):
         "TotalCharges": total_charges
     }
     
+    final_prob = None
+    risk_status = "UNKNOWN"
+    risk_tier = "Unknown"
+    rec = ""
+    factors = []
+    
+    # Try FastAPI endpoint first
     try:
-        res = requests.post(API_URL_SINGLE, json=payload, timeout=5)
+        res = requests.post(f"{API_URL_SINGLE}?threshold={decision_threshold}", json=payload, timeout=3)
         if res.status_code == 200:
             data = res.json()
             final_prob = data["churn_probability"]
-            status_text = data["risk_status"]
+            risk_status = data["risk_status"]
+            risk_tier = data.get("risk_tier", "High Risk" if final_prob >= decision_threshold else "Safe")
             rec = data["recommendation"]
+            factors = data.get("key_risk_factors", [])
         else:
-            error_detail = res.json().get('detail', 'Validation Failed')
-            st.sidebar.error(f"Validation Error: {error_detail}")
-            final_prob = None
+            raise Exception("API error")
     except Exception:
-        # Fallback to local model execution
-        single_raw = pd.DataFrame([payload])
-        proc_X, _ = add_interaction_features(single_raw, single_raw.copy())
-        encoded_df = transform_categorical_inference(proc_X)
-        
-        models_lgb = load_all_fold_models("lgb")
-        models_cat = load_all_fold_models("cat")
-        preds = [m.predict_proba(encoded_df)[:, 1][0] for m in models_lgb + models_cat]
-        
-        final_prob = float(np.mean(preds)) if preds else 0.25
-        status_text = "HIGH RISK" if final_prob > 0.5 else "SAFE"
-        rec = "Route profile to Retention Team." if final_prob > 0.5 else "Customer displays strong account stability and low churn risk."
+        # Fallback to local master weighted ensemble
+        if total_loaded_folds == 0:
+            st.sidebar.error("Error: Models are not found on disk. Please train models first!")
+        else:
+            single_raw = pd.DataFrame([payload])
+            proc_X = add_interaction_features(single_raw)
+            encoded_df = transform_categorical_inference(proc_X)
+            
+            prob_arr = predict_master_ensemble(encoded_df, models_dict=master_models)
+            final_prob = float(prob_arr[0])
+            is_high = final_prob >= decision_threshold
+            risk_status = "HIGH RISK" if is_high else "SAFE"
+            
+            if final_prob < 0.20:
+                risk_tier = "Low Risk / Highly Loyal"
+                rec = "Customer demonstrates high account stickiness. Standard relationship management."
+            elif final_prob < decision_threshold:
+                risk_tier = "Moderate Risk / Watchlist"
+                rec = "Customer exhibits mild churn signals. Recommend engagement survey or low-cost perk."
+            elif final_prob < 0.65:
+                risk_tier = "High Risk / Action Required"
+                rec = "Route profile to Retention Specialists. Present contract upgrade incentives."
+            else:
+                risk_tier = "Critical Risk / Urgent Intervention"
+                rec = "Immediate executive escalation or personalized price-lock discount required."
+                
+            factors = explain_customer_risk(payload, final_prob)
 
     if final_prob is not None:
         with st.sidebar.container(border=True):
-            st.subheader("System Recommendation")
-            if final_prob > 0.50:
-                st.error(f"{status_text}: {final_prob:.1%}")
+            st.subheader("Decisioning Summary")
+            pct = final_prob * 100
+            if final_prob >= decision_threshold:
+                st.error(f"**{risk_status} ({pct:.1f}%)**")
             else:
-                st.success(f"{status_text}: {final_prob:.1%}")
-            st.write(rec)
+                st.success(f"**{risk_status} ({pct:.1f}%)**")
+                
+            st.caption(f"Risk Tier: **{risk_tier}** (Cutoff: {decision_threshold:.2f})")
+            st.write(f"**Action Plan:** {rec}")
+            
+            if factors:
+                st.markdown("#### Primary Drivers")
+                for f in factors:
+                    icon = "🔴" if f["impact"] == "HIGH RISK" else ("🟡" if f["impact"] == "MODERATE RISK" else "🟢")
+                    st.markdown(f"{icon} **{f['feature']}**: {f['detail']}")
 
-main_layout, status_panel = st.columns([2, 1])
+# Main Page Layout: System Status & Batch Analysis
+main_layout, status_panel = st.columns([2.2, 1])
+
+with status_panel:
+    with st.container(border=True):
+        st.subheader("Pipeline Health & Registry")
+        st.write(f"LightGBM Folds: **{len(lgb_models)} / 10**")
+        st.write(f"CatBoost Folds: **{len(cat_models)} / 10**")
+        st.write(f"Pseudo-LGBM Folds: **{len(pseudo_models)} / 10**")
+        st.write(f"Ensemble Blend: **40% LGB + 30% CAT + 30% Pseudo**")
+        st.write(f"Calibrated Threshold: **{decision_threshold:.2f}**")
+        engine_status = "Fully Operational" if total_loaded_folds >= 10 else "Degraded / Train Models"
+        st.caption(f"Status: **{engine_status}**")
 
 with main_layout:
-    st.header("Batch System File Upload")
-    st.write("Drop your unprocessed raw test datasets below to run features through the optimization pipeline.")
+    st.header("Enterprise Batch Scoring & Financial Exposure")
+    st.write("Upload client datasets to run feature engineering and score accounts with the 30-model ensemble.")
     
-    with st.expander("New User? Learn how to format your file"):
+    with st.expander("CSV Format Guide & Template"):
+        st.markdown("""
+        Ensure your CSV contains columns like `tenure`, `MonthlyCharges`, `TotalCharges`, `Contract`, `InternetService`, etc.
+        Missing columns will be handled with domain-safe imputation.
+        """)
         template_df = pd.DataFrame([{
             "id": "7590-VHVEG", "gender": "Female", "SeniorCitizen": 0, "Partner": "Yes", "Dependents": "No",
             "tenure": 1, "PhoneService": "No", "MultipleLines": "No phone service", "InternetService": "DSL",
@@ -128,63 +211,102 @@ with main_layout:
             "StreamingTV": "No", "StreamingMovies": "No", "Contract": "Month-to-month",
             "PaperlessBilling": "Yes", "PaymentMethod": "Electronic check", "MonthlyCharges": 29.85, "TotalCharges": 29.85
         }])
-        template_csv = template_df.to_csv(index=False).encode('utf-8')
-        st.download_button("Download Sample Template (CSV)", data=template_csv, file_name="sample_churn_template.csv", mime="text/csv")
+        st.download_button("Download CSV Template", data=template_df.to_csv(index=False).encode('utf-8'), file_name="churn_template.csv", mime="text/csv")
 
-    uploaded_file = st.file_uploader("Choose a CSV file containing client data records", type=["csv"])
+    uploaded_file = st.file_uploader("Upload Raw CSV Dataset", type=["csv"])
 
-with status_panel:
-    with st.container(border=True):
-        models_lgb = load_all_fold_models("lgb")
-        models_cat = load_all_fold_models("cat")
-        st.subheader("Pipeline Registry Status")
-        st.write(f"LightGBM Fold Models: {len(models_lgb)} / 10 Loaded")
-        st.write(f"CatBoost Fold Models: {len(models_cat)} / 10 Loaded")
-        st.write(f"Live Inference Engine: {'Operational' if (models_lgb or models_cat) else 'Fallback Mode'}")
-
+# Batch Execution Handling
 if uploaded_file is not None:
-    st.header("Pipeline Execution Trace")
+    st.markdown("---")
+    st.header("Batch Processing & Risk Exposure Analysis")
     test_raw = pd.read_csv(uploaded_file)
-    st.write("Raw File Loaded Successfully:", test_raw.head(3))
+    st.write(f"Loaded **{len(test_raw):,} records**. Sample preview:", test_raw.head(3))
 
-    with st.spinner("Executing live pipeline feature engineering layers..."):
-        try:
-            files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "text/csv")}
-            res = requests.post(API_URL_BATCH, files=files, timeout=30)
-            if res.status_code == 200:
-                batch_res = res.json()
-                live_predictions = batch_res["predictions"]
-                ids = batch_res["ids"]
-            else:
-                raise Exception("Batch API Offline")
-        except Exception:
-            mock_X = test_raw.copy().drop(columns=["id", "Churn"], errors="ignore")
-            X_feat, _ = add_interaction_features(mock_X, mock_X)
-            encoded_df = transform_categorical_inference(X_feat)
-            preds = [m.predict_proba(encoded_df)[:, 1] for m in models_lgb + models_cat]
-            live_predictions = np.mean(preds, axis=0) if preds else np.random.uniform(0.05, 0.45, len(test_raw))
-            ids = test_raw["id"] if "id" in test_raw.columns else [f"CUST-{i}" for i in range(len(test_raw))]
+    if total_loaded_folds == 0:
+        st.error("Cannot score batch dataset: No trained models found in the outputs directory.")
+    else:
+        with st.spinner("Executing feature engineering & master ensemble scoring..."):
+            try:
+                # Try batch API first
+                files = {"file": (uploaded_file.name, uploaded_file.getvalue(), "text/csv")}
+                res = requests.post(f"{API_URL_BATCH}?threshold={decision_threshold}", files=files, timeout=45)
+                if res.status_code == 200:
+                    batch_res = res.json()
+                    live_predictions = batch_res["predictions"]
+                    ids = batch_res["ids"]
+                else:
+                    raise Exception("Batch API offline")
+            except Exception:
+                # Fallback to local master ensemble
+                mock_X = test_raw.copy().drop(columns=["id", "Churn"], errors="ignore")
+                X_feat = add_interaction_features(mock_X)
+                encoded_df = transform_categorical_inference(X_feat)
+                live_predictions = predict_master_ensemble(encoded_df, models_dict=master_models).tolist()
+                ids = test_raw["id"].tolist() if "id" in test_raw.columns else [f"CUST-{i}" for i in range(len(test_raw))]
 
-    st.success("Pipeline complete! Generating dynamic model inferences...")
-    
-    output_df = pd.DataFrame({
-        "id": ids,
-        "Churn Probability": live_predictions,
-        "Risk Category": ["HIGH RISK" if p > 0.5 else "SAFE" for p in live_predictions]
-    })
-
-    preview_col, chart_col = st.columns(2)
-    with preview_col:
-        st.write("Final Output Preview", output_df.head(5))
-    with chart_col:
-        high_risk_count = (output_df["Churn Probability"] > 0.5).sum()
-        safe_count = len(output_df) - high_risk_count
-        chart_metrics = pd.DataFrame({
-            "Customer Status": ["Safe / Loyal", "At-Risk / Churn"],
-            "Count": [safe_count, high_risk_count]
+        # Construct Output DataFrame
+        output_df = pd.DataFrame({
+            "id": ids,
+            "Churn Probability": [round(p, 4) for p in live_predictions],
+            "Risk Category": ["HIGH RISK" if p >= decision_threshold else "SAFE" for p in live_predictions],
+            "Risk Tier": [
+                "Critical Risk" if p >= 0.65 else ("High Risk" if p >= decision_threshold else ("Watchlist" if p >= 0.20 else "Low Risk"))
+                for p in live_predictions
+            ]
         })
-        st.write("Pipeline Risk Distribution Breakdown")
-        st.bar_chart(data=chart_metrics, x="Customer Status", y="Count", color="#1E3A8A")
 
-    output_csv = output_df.to_csv(index=False).encode('utf-8')
-    st.download_button("Download Final Master Predictions (CSV)", data=output_csv, file_name="live_master_predictions.csv", mime="text/csv", use_container_width=True)
+        # Calculate Financial Exposure (MRR at Risk)
+        high_risk_mask = output_df["Risk Category"] == "HIGH RISK"
+        high_risk_count = int(high_risk_mask.sum())
+        total_records = len(output_df)
+        churn_rate = (high_risk_count / total_records) * 100 if total_records > 0 else 0
+
+        total_mrr_risk = 0.0
+        if "MonthlyCharges" in test_raw.columns:
+            m_charges = pd.to_numeric(test_raw["MonthlyCharges"], errors="coerce").fillna(0.0)
+            total_mrr_risk = float(m_charges[high_risk_mask].sum())
+
+        # Metric KPI Cards
+        kpi1, kpi2, kpi3, kpi4 = st.columns(4)
+        kpi1.metric("Scored Accounts", f"{total_records:,}")
+        kpi2.metric("At-Risk Accounts", f"{high_risk_count:,}", f"{churn_rate:.1f}%")
+        kpi3.metric("Decision Cutoff", f"{decision_threshold:.2f}")
+        kpi4.metric("MRR at Risk", f"${total_mrr_risk:,.2f}")
+
+        # Visual Analytics
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Risk Tier Distribution")
+            tier_counts = output_df["Risk Tier"].value_counts().reset_index()
+            tier_counts.columns = ["Risk Tier", "Accounts"]
+            st.bar_chart(tier_counts, x="Risk Tier", y="Accounts")
+
+        with c2:
+            st.subheader("Churn Probability Decile Curve")
+            deciles = pd.qcut(output_df["Churn Probability"], q=10, duplicates="drop").value_counts().sort_index()
+            decile_df = pd.DataFrame({"Probability Range": [str(interval) for interval in deciles.index], "Count": deciles.values})
+            st.bar_chart(decile_df, x="Probability Range", y="Count")
+
+        # Table & Download
+        st.subheader("Actionable Retention Queue")
+        filter_tier = st.selectbox("Filter by Risk Tier", ["All Accounts", "High & Critical Risk Only", "Critical Risk Only", "Safe Accounts Only"])
+        if filter_tier == "High & Critical Risk Only":
+            display_df = output_df[output_df["Risk Category"] == "HIGH RISK"]
+        elif filter_tier == "Critical Risk Only":
+            display_df = output_df[output_df["Risk Tier"] == "Critical Risk"]
+        elif filter_tier == "Safe Accounts Only":
+            display_df = output_df[output_df["Risk Category"] == "SAFE"]
+        else:
+            display_df = output_df
+
+        st.dataframe(display_df, use_container_width=True, height=250)
+
+        output_csv = output_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            "Download Scored Master Churn Predictions (CSV)",
+            data=output_csv,
+            file_name="master_churn_predictions.csv",
+            mime="text/csv",
+            use_container_width=True,
+            type="primary"
+        )

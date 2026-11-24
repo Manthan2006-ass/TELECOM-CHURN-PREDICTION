@@ -1,29 +1,54 @@
-# 🚀 Enterprise Telecom Churn Prediction Microservice
+# Telecom Customer Churn & Retention Intelligence Engine
 
-An end-to-end, production-grade Machine Learning pipeline and web application for predicting customer churn in the telecom industry. The system utilizes LightGBM, CatBoost, and Pseudo-Labeling ensembles served via a high-performance **FastAPI microservice** and an interactive **Streamlit dashboard**.
-
----
-
-## 📌 Architecture Highlights
-
-* **Decoupled Architecture:** Separates the frontend dashboard (`Streamlit`) from the core inference engine (`FastAPI`).
-* **Deterministic Stateful Encoding:** Utilizes Scikit-Learn's `OrdinalEncoder` fit on training data and persisted to disk (`encoder.pkl`) to ensure zero feature drift between training and live REST inference.
-* **Full K-Fold Ensembling:** Aggregates predictions across all 10 trained Stratified K-Fold binaries to prevent variance and preserve cross-validation integrity.
-* **Strict Payload Validation:** Uses **Pydantic** schemas with custom `@model_validator` functions to enforce data types, range bounds, and domain consistency rules (e.g., catching impossible option combinations).
-* **High-Throughput Serving:** Leverages lazy model loading and asynchronous thread execution (`asyncio.to_thread`) to process single and batch CSV inferences without blocking the API event loop.
+An enterprise-grade machine learning platform for customer churn risk prediction and retention intelligence. Built with a 10-Fold Blended Ensemble (LightGBM, CatBoost, and Semi-Supervised Pseudo-Labeling), calibrated for top-decile business capture and served via a FastAPI microservice and Streamlit retention dashboard.
 
 ---
 
-## 📁 Repository Structure
+## Measurable Results & Delivery
 
-```text
-├── app.py              # Streamlit frontend dashboard (Single Profile & Batch CSV)
-├── api.py              # FastAPI microservice serving REST prediction endpoints
-├── schemas.py          # Pydantic data validation contracts & domain rules
-├── utils.py            # Centralized pipeline logic, stateful encoding, & config
-├── trainlgb.py         # Trains 10-fold LightGBM models
-├── traincat.py         # Trains 10-fold CatBoost models
-├── trainpsuedo.py      # Trains 10-fold LightGBM models with pseudo-labeled data
-├── ensemble.py         # Evaluates blended out-of-fold predictions & test submission
-├── requirements.txt    # Python package dependencies
-└── outputs/            # Saved model artifacts (.pkl), encoder rules, & CSV outputs
+Evaluated on **601,237 customer records** via 10-fold stratified cross-validation with out-of-fold (`oof`) validation:
+
+- **ROC-AUC**: **0.9158 (91.58%)** on the blended 3-way ensemble (0.40 LGB + 0.30 CatBoost + 0.30 Pseudo-LGBM).
+- **Top Decile Capture Rate**: Identifies **36.73% of all churners** in the top 10% risk tier (49,836 out of 135,686 total churners).
+- **Top Decile Precision & Lift**: **82.89% precision** (vs 22.57% base rate), delivering a **3.67x lift** over random retention outreach.
+- **Top 20% Capture Rate**: Captures **63.48% of all churners** within the top 2 deciles.
+- **Optimal Decision Threshold ($p = 0.36$)**: Achieves **0.7017 F1-score** and lifts recall to **78.09%**.
+- **Model Calibration**: Brier score of **0.0955**.
+
+---
+
+## System Architecture
+
+- **Machine Learning Pipeline**:
+  - `utils.py`: Domain interaction feature engineering (`Charges_Ratio`, tenure hazard estimators), categorical alignment, and weighted ensemble logic.
+  - `trainlgb.py`: 10-Fold Stratified LightGBM training.
+  - `traincat.py`: 10-Fold Stratified CatBoost training.
+  - `trainpsuedo.py`: Semi-supervised pseudo-labeling with confidence bounds ($>0.92$ and $<0.08$).
+  - `ensemble.py`: Optimal OOF blending and master submission generation.
+- **FastAPI Microservice (`api.py`)**:
+  - Asynchronous lifespan architecture loading all 30 fold models.
+  - Single-profile scoring endpoint (`/predict`) with business threshold parameters and rule-based explainability drivers.
+  - High-throughput batch scoring endpoint (`/predict-batch`) with Monthly Recurring Revenue (MRR) at-risk analytics.
+- **Streamlit Analytics Dashboard (`app.py`)**:
+  - Cached model pipeline (`@st.cache_resource`) for zero-latency slider and dropdown interactions.
+  - Single-customer decisioning summary with primary churn risk factor cards.
+  - Batch dataset evaluation with interactive probability decile curves and downloadable retention queues.
+
+---
+
+## Quick Start
+
+### 1. Install Dependencies
+```bash
+pip install -r requirements.txt
+```
+
+### 2. Start the FastAPI Microservice
+```bash
+uvicorn api:app --reload --port 8000
+```
+
+### 3. Launch the Streamlit Retention Dashboard
+```bash
+streamlit run app.py
+```
